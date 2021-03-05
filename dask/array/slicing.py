@@ -1781,3 +1781,235 @@ def setitem(
     array[tuple(block_indices)] = v
 
     return array
+
+def setitem2(
+    array,
+    value,
+    block_info=None,
+    indices=None,
+    non_broadcast_dimensions=None,
+    offset=None,
+    base_value_indices=None,
+    mirror=None,
+    value_common_shape=None,
+):
+    """Function to be mapped across all blocks which assigns new values to elements of each block.
+
+    This function should not be used directly, instead, a new partial
+    function with value set should be used, e.g.::
+
+        self.map_blocks(functools.partial(setitem, value=x), **kwargs)
+
+    Parameters
+    ----------
+    value : array-like
+        The value from which to assign to the indices.
+    block_info:
+    indices : sequence of slice or int
+        A reformated version of the original indices that were passed
+        to __setitem__.
+    non_broadcast_dimensions : list of int
+        The dimensions of value which do not need to be broadcast
+        against the subspace defined by the indices.
+    offset: `int`
+        The difference in the relative positions of a dimension in
+        value and the corresponding dimension in self. A positive
+        value means the dimension position is higher (further to the
+        right) in self then value.
+    base_value_indices : list of slice or None
+        The indices used for initialising the selection from
+        value. slice(None) elements are unchanged, but an element of
+        None is replaced by an appropriate slice.
+    mirror: list of int
+        The dimensions that need to be reversed in the value, prior to
+        assignment.
+    value_common_shape: tuple of int
+        The shape of those dimensions of value which correspond to
+        dimensions of self.
+
+    Returns
+    -------
+    array : numpy.ndarray
+        The array for the block with assigned elements.
+
+    """
+    array_location = block_info[None]["array-location"]
+
+    # See if this block overlaps the indices
+    overlaps = True
+    block_indices = []
+    subset_shape = []
+    preceeding_size = []
+    local_offset = offset
+    j = -1
+    for index, (loc0, loc1), size, full_size in zip(
+        indices,
+        array_location,
+        block_info[None]["chunk-shape"],
+        block_info[None]["shape"],
+    ):
+        j += 1
+
+        integer_index = isinstance(index, int)
+        if isinstance(index, slice):
+            # Index is a slice
+            stop = size
+            if index.stop < loc1:
+                stop -= loc1 - index.stop
+
+            start = index.start - loc0
+            if start < 0:
+                # Make start positive
+                start %= index.step
+
+            if start >= stop:
+                # This block does not overlap the indices
+                overlaps = False
+                break
+
+            # Still here? Then this block does overlap the indices
+            step = index.step
+            block_index = slice(start, stop, step)
+            block_index_size, rem = divmod(stop - start, step)
+            if rem:
+                block_index_size += 1
+
+            # Find how many elements of 'value' precede this block
+            # along this dimension. Note that it is assumed that the
+            # slice step is positive, as will be the case for
+            # reformatted indices.
+            pre = index.indices(loc0)
+            n_preceeding, rem = divmod(pre[1] - pre[0], step)
+            if rem:
+                n_preceeding += 1
+        elif integer_index:
+            # Index is an integer
+            local_offset += 1
+            if not loc0 <= index < loc1:
+                # This block does not overlap the index
+                overlaps = False
+                break
+
+            block_index = index - loc0
+        else:
+            is_bool = index.dtype == bool
+
+            if is_bool:
+                # Index is a boolean array
+                block_index = np.nonzero(index[loc0:loc1])[0]
+            else:
+                # Index is an integer array
+                block_index = np.array([i - loc0 for i in index if loc0 <= i < loc1])
+
+            block_index_size = block_index.size
+
+            if is_bool and loc1 == full_size:
+                if value.size > 1:
+                    x = value.shape[j - local_offset]
+                    if x > 1 and int(np.sum(index)) < x:
+                        raise ValueError(
+                            "shape mismatch: value array of shape "
+                            f"{value.shape} could not be broadcast "
+                            "to indexing result"
+                        )
+
+            if not block_index_size:
+                # This block does not overlap the indices
+                overlaps = False
+                break
+
+            # Still here? Then this array block does overlap the 1-d
+            # array indices
+
+            # If possible, replace the 1-d array with a slice (for
+            # faster numpy assignment)
+            if block_index.size == 1:
+                block_index = slice(block_index[0], block_index[0] + 1)
+            else:
+                steps = block_index[1:] - block_index[:-1]
+                step = steps[0]
+                if step and not (steps - step).any():
+                    start, stop = block_index[0], block_index[-1] + 1
+                    block_index = slice(start, stop, step)
+
+            # Find how many elements of 'value' precede this block
+            # along this dimension. Note that it is assumed that the
+            # slice step is positive, as will be the case for
+            # reformatted indices.
+            if is_bool:
+                n_preceeding = int(np.sum(index[:loc0]))
+            else:
+                n_preceeding = sum(1 for i in index if i < loc0)
+
+        block_indices.append(block_index)
+        if not integer_index:
+            preceeding_size.append(n_preceeding)
+            subset_shape.append(block_index_size)
+
+    if not overlaps:
+        # This block does not overlap the indices, so return the block
+        # unchanged.
+        return array
+
+    # Still here? Then this block overlaps the indices and so needs to
+    # have some of its elements assigned.
+
+    # Initialise the indices of 'value' that define the parts of it
+    # which are to be assigned to this block
+    value_indices = base_value_indices[:]
+    for i in non_broadcast_dimensions:
+        j = i + offset
+        start = preceeding_size[j]
+        value_indices[i] = slice(start, start + subset_shape[j])
+
+    # Reverse the indices to 'value' if required as a consequence of
+    # reformatting the original indices.
+    for i in mirror:
+        size = value_common_shape[i]
+        start, stop, step = value_indices[i].indices(size)
+        size -= 1
+        start = size - start
+        stop = size - stop
+        if stop < 0:
+            stop = None
+
+        value_indices[i] = slice(start, stop, -1)
+
+    if value.ndim > len(indices):
+        # 'value' has more dimensions than self, so add a leading
+        # Ellipsis to the indices of 'value'.
+        value_indices.insert(0, Ellipsis)
+
+    # Get the part of 'value' that is to be assigned to elements of
+    # this block
+#    v = np.asanyarray(value[tuple(value_indices)])
+    v = value[tuple(value_indices)]
+
+    # Check for shape mismatch, which could occur if we didn't know
+    # the subset shape until now (which might be the case if the
+    # original index was a dask collection of booleans).
+    for i in non_broadcast_dimensions:
+        if v.shape[i] != subset_shape[i + offset]:
+            raise ValueError(
+                f"shape mismatch: value array of shape {value.shape} "
+                "could not be broadcast to indexing result"
+            )
+
+    if not np.ma.isMA(array) and np.ma.isMA(v):
+        # The block is not masked but the assignment is masking
+        # elements, so turn the non-masked block into a masked one.
+        array = array.view(np.ma.MaskedArray)
+
+    # Assign elements of 'value' to elements of this block
+    if not array.flags["WRITEABLE"]:
+        # array is read-only, so need to copy it first (e.g. this
+        # might be the case if the dask array was created by da.empty)
+        array = array.copy()
+    elif getrefcount(array) > 2:
+        # Copy the array if it is in use elsewhere, to avoid
+        # corrupting other objects.
+        array = array.copy()
+
+    array[tuple(block_indices)] = v
+
+    return array
