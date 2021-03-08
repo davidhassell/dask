@@ -3673,6 +3673,7 @@ def test_setitem_extended_API():
     ] = -55
     dx[np.array([False, False, True, True, False, False]), 5:7] = -66
 
+    dx = dx.persist()
     assert_eq(x, dx.compute())
     assert_eq(x.mask, da.ma.getmaskarray(dx))
 

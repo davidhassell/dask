@@ -64,8 +64,7 @@ from .slicing import (
     replace_ellipsis,
     cached_cumsum,
     parse_assignment_indices,
-    setitem,
-    setitem2,
+    setitem_layer,
 )
 from .blockwise import blockwise
 from .chunk_types import is_valid_array_chunk, is_valid_chunk_type
@@ -1649,14 +1648,9 @@ class Array(DaskMethodsMixin):
             # Convert masked to a scalar masked array
             value = np.ma.array(0, mask=True)
 
-        if value is self:
-            # Need to copy value if it is the same as self. This
-            # allows x[...] = x and x[...] = x[...], etc.
-            value = value.copy()
-
         value = asanyarray(value)
         value_shape = value.shape
-
+            
         if 0 in indices_shape and value.size > 1:
             # Can only assign size 1 values (with any number of
             # dimensions) to empty slices
@@ -1738,32 +1732,17 @@ class Array(DaskMethodsMixin):
                     f"across shape {tuple(indices_shape)}"
                 )
 
-        # Map the setitem function across all blocks
-        y = map_blocks(
-            setitem2,
-            self,
-            value,
-            dtype=self.dtype,
-            indices=indices,
+        name = "setitem-" + tokenize(self, indices, value)
+       
+        dsk = setitem_layer(
+            self, value, indices, name,
             non_broadcast_dimensions=non_broadcast_dimensions,
-            offset=offset,
-            base_value_indices=base_value_indices,
-            mirror=mirror,
-            value_common_shape=value_common_shape,
+            offset=offset, base_value_indices=base_value_indices,
+            mirror=mirror, value_common_shape=value_common_shape
         )
-
-            
-#        # Map the setitem function across all blocks
-#        y = self.map_blocks(
-#            partial(setitem, value=value),
-#            dtype=self.dtype,
-#            indices=indices,
-#            non_broadcast_dimensions=non_broadcast_dimensions,
-#            offset=offset,
-#            base_value_indices=base_value_indices,
-#            mirror=mirror,
-#            value_common_shape=value_common_shape,
-#        )
+       
+        graph = HighLevelGraph.from_collections(name, dsk, dependencies=[self])
+        y = Array(graph, name, chunks=self.chunks, dtype=self.dtype)
 
         self._meta = y._meta
         self.dask = y.dask
